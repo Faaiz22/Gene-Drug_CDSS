@@ -1,0 +1,5 @@
+
+DualBranchNet:
+[Drug Features] -> [Drug Encoder]                                        [Fusion Layer] -> Sigmoid -> Association Probability
+                   /
+[Protein Features] -> [Protein Encoder]

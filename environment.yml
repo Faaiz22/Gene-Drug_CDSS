@@ -1,0 +1,24 @@
+name: drug_gene_cdss
+channels:
+  - rdkit
+  - pytorch
+  - conda-forge
+dependencies:
+  - python=3.10
+  - rdkit
+  - pytorch
+  - scikit-learn
+  - biopython
+  - numpy
+  - pandas
+  - seaborn
+  - matplotlib
+  - tqdm
+  - umap-learn
+  - plotly
+  - streamlit
+  - openpyxl
+  - pip
+  - pip:
+      - selfies
+      - py3Dmol

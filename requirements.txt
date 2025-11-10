@@ -1,0 +1,15 @@
+torch
+torchvision
+pandas
+numpy
+scikit-learn
+biopython
+rdkit-pypi
+tqdm
+umap-learn
+matplotlib
+seaborn
+plotly
+streamlit
+py3Dmol
+selfies

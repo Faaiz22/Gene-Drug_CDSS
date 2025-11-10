@@ -1,0 +1,9 @@
+# Path configuration for dataset, artifacts, and logs
+
+base_dir: .
+data_dir: data
+raw_data: data/raw
+processed_data: data/processed
+artifacts_dir: artifacts
+logs_dir: logs
+models_dir: models

@@ -1,0 +1,242 @@
+
+import streamlit as st
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import json
+import torch
+import base64
+import io
+from importlib import import_module
+
+ARTIFACTS_DIR = Path("../artifacts")  # relative to app/ when repo root is used; adjust if needed
+
+st.set_page_config(page_title="Drug–Gene 3D Association Explorer", layout="wide", initial_sidebar_state="expanded")
+
+# helper functions
+@st.cache_data
+def load_csv(path):
+    return pd.read_csv(path)
+
+@st.cache_data
+def load_npy(path):
+    return np.load(path)
+
+@st.cache_resource
+def load_model(path):
+    # minimal loader using src.models.dual_branch_net.DualBranchNet
+    try:
+        from src.models.dual_branch_net import DualBranchNet
+    except Exception:
+        class DualBranchNet:
+            def __init__(self, *a, **k):
+                pass
+            def eval(self): pass
+            def __call__(self, *a, **k): return np.array([0.5])
+    model = DualBranchNet()
+    try:
+        import torch
+        state = torch.load(path, map_location='cpu')
+        try:
+            model.load_state_dict(state)
+        except Exception:
+            try:
+                model.load_state_dict(state.get('model_state_dict', state))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return model
+
+def get_download_link_bytes(content: bytes, filename: str, label: str = "Download"):
+    b64 = base64.b64encode(content).decode()
+    href = f'<a href="data:application/octet-stream;base64,{b64}" download="{filename}">{label}</a>'
+    return href
+
+# Load artifacts (best-effort)
+artifact_files = {p.name:p for p in ARTIFACTS_DIR.glob("*")} if ARTIFACTS_DIR.exists() else {}
+pairwise_df = None
+fusion = None
+drug_emb = None
+prot_emb = None
+model = None
+metrics = {}
+metrics_test = {}
+
+if (ARTIFACTS_DIR / "pairwise_index_labels.csv").exists():
+    pairwise_df = load_csv(ARTIFACTS_DIR / "pairwise_index_labels.csv")
+if (ARTIFACTS_DIR / "fusion_embeddings.npy").exists():
+    fusion = load_npy(ARTIFACTS_DIR / "fusion_embeddings.npy")
+if (ARTIFACTS_DIR / "features_drug.npy").exists():
+    drug_emb = load_npy(ARTIFACTS_DIR / "features_drug.npy")
+if (ARTIFACTS_DIR / "features_protein.npy").exists():
+    prot_emb = load_npy(ARTIFACTS_DIR / "features_protein.npy")
+if (ARTIFACTS_DIR / "model.pt").exists():
+    model = load_model(ARTIFACTS_DIR / "model.pt")
+if (ARTIFACTS_DIR / "metrics.json").exists():
+    with open(ARTIFACTS_DIR / "metrics.json") as f:
+        metrics = json.load(f)
+if (ARTIFACTS_DIR / "metrics_test.json").exists():
+    with open(ARTIFACTS_DIR / "metrics_test.json") as f:
+        metrics_test = json.load(f)
+
+# import components
+try:
+    from components.mol_viewer import mol_to_png_bytes
+    from components.umap_plot import scatter_2d
+    from components.docking_plot import docking_scatter
+except Exception:
+    mol_to_png_bytes = None
+    scatter_2d = None
+    docking_scatter = None
+
+# Sidebar
+st.sidebar.title("Navigation")
+page = st.sidebar.radio("Go to", [
+    "Overview", "Data Explorer", "Latent Space", "Query", "Repurposing", "Generation", "Docking", "Diagnostics", "Downloads"
+])
+
+# Pages
+if page == "Overview":
+    st.title("Drug–Gene 3D Association Explorer — Overview")
+    cols = st.columns(4)
+    pairs = len(pairwise_df) if pairwise_df is not None else 0
+    genes = pairwise_df['Gene_ID'].nunique() if pairwise_df is not None else 0
+    drugs = pairwise_df['Drug_ID'].nunique() if pairwise_df is not None else 0
+    cols[0].metric("Pairs", pairs)
+    cols[1].metric("Genes", genes)
+    cols[2].metric("Drugs", drugs)
+    cols[3].metric("AUC (val/test)", f"{metrics.get('auc','-')}/{metrics_test.get('auc','-')}")
+    st.markdown("""This app loads artifacts produced by the training pipeline. Use the sidebar to explore the dataset and models.""")
+
+elif page == "Data Explorer":
+    st.header("Data Explorer")
+    if pairwise_df is None:
+        st.warning("pairwise_index_labels.csv not found in artifacts.")
+    else:
+        st.dataframe(pairwise_df.head(200))
+        csv = pairwise_df.to_csv(index=False).encode()
+        st.markdown(get_download_link_bytes(csv, "pairwise_preview.csv", "Download preview"), unsafe_allow_html=True)
+
+elif page == "Latent Space":
+    st.header("Latent Space Viewer")
+    if fusion is None or pairwise_df is None:
+        st.warning("Fusion embeddings or pairwise index not available.")
+    else:
+        coords_path = ARTIFACTS_DIR / "fusion_umap_2d.npy"
+        if coords_path.exists():
+            coords = load_npy(coords_path)
+        else:
+            try:
+                import umap
+                coords = umap.UMAP(n_components=2, random_state=42).fit_transform(fusion)
+            except Exception:
+                from sklearn.decomposition import PCA
+                coords = PCA(n_components=2).fit_transform(fusion)
+        if scatter_2d:
+            fig = scatter_2d(coords, pairwise_df, color_by=st.selectbox("Color by", ["Association_Label","Gene_ID","Drug_ID"]))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.write("Install app components to enable interactive plotting.")
+
+elif page == "Query":
+    st.header("Gene–Drug Query")
+    st.write("Provide Gene_ID and Drug_SMILES or choose from dataset to compute model score.")
+    if pairwise_df is None:
+        st.warning("Dataset required.")
+    else:
+        gene = st.selectbox("Gene_ID", options=["--"] + sorted(pairwise_df['Gene_ID'].astype(str).unique().tolist()))
+        drug = st.selectbox("Drug_ID (optional)", options=["--"] + sorted(pairwise_df['Drug_ID'].astype(str).unique().tolist()))
+        smi = st.text_input("Or enter SMILES (overrides Drug_ID)")
+        if st.button("Predict"):
+            # minimal prediction: map to embeddings if available
+            idx = None
+            if drug != "--":
+                rows = pairwise_df[pairwise_df['Drug_ID'].astype(str)==drug]
+                if not rows.empty:
+                    idx = rows.index[0]
+            if smi and mol_to_png_bytes:
+                st.image(mol_to_png_bytes(smi))
+            if drug_emb is not None and prot_emb is not None and idx is not None:
+                import torch
+                d = torch.tensor(drug_emb[idx:idx+1], dtype=torch.float32)
+                p = torch.tensor(prot_emb[idx:idx+1], dtype=torch.float32)
+                try:
+                    prob = float(model(d,p).cpu().numpy().ravel()[0])
+                except Exception:
+                    prob = 0.5
+                st.metric("Predicted association", f"{prob:.3f}")
+            else:
+                st.info("Embeddings or model not available for concrete prediction.")
+
+elif page == "Repurposing":
+    st.header("Repurposing Engine")
+    if pairwise_df is None or fusion is None:
+        st.warning("Need pairwise table and fusion embeddings.")
+    else:
+        gene = st.selectbox("Choose gene", options=["--"] + sorted(pairwise_df['Gene_ID'].astype(str).unique().tolist()))
+        k = st.slider("Top-K candidates", 5, 200, 25)
+        exclude_known = st.checkbox("Exclude known positives", value=True)
+        if st.button("Run"):
+            import numpy as np
+            import pandas as pd
+            idxs = pairwise_df.index[pairwise_df['Gene_ID'].astype(str)==gene].tolist()
+            if not idxs:
+                st.error("Gene not present or no entries.")
+            else:
+                pos = [i for i in idxs if pairwise_df.loc[i,'Association_Label']==1]
+                centroid = fusion[pos].mean(axis=0) if pos else fusion[idxs].mean(axis=0)
+                sims = np.dot(fusion, centroid) / (np.linalg.norm(fusion,axis=1)*np.linalg.norm(centroid)+1e-9)
+                dfc = pairwise_df.copy()
+                dfc['similarity'] = sims
+                if exclude_known:
+                    known = set(pairwise_df.loc[pairwise_df['Gene_ID']==gene].loc[lambda d: d['Association_Label']==1, 'Drug_ID'].tolist())
+                    dfc = dfc[~dfc['Drug_ID'].isin(known)]
+                out = dfc.sort_values('similarity', ascending=False).head(k)
+                st.dataframe(out[['Gene_ID','Drug_ID','similarity','Association_Label']].reset_index(drop=True))
+                st.markdown(get_download_link_bytes(out.to_csv(index=False).encode(), f"repurposing_{gene}.csv", "Download"), unsafe_allow_html=True)
+
+elif page == "Generation":
+    st.header("Generative Design (Scaffold)")
+    st.write("""This is a scaffold: retrieval + conservative perturbation is used as a baseline generator.
+             For full generator, integrate a ConditionalVAE/Transformer in src/models.""")
+    st.info("Generation is offline — use notebook/pipelines to run heavy operations.")
+
+elif page == "Docking":
+    st.header("Docking Integration")
+    uploaded = st.file_uploader("Upload docking CSV (SMILES,Docking_Energy)", type=['csv','tsv','json'])
+    if uploaded:
+        try:
+            dock_df = pd.read_csv(uploaded) if str(uploaded.name).endswith('.csv') else pd.read_json(uploaded)
+            st.dataframe(dock_df.head(20))
+            final_csvs = list(ARTIFACTS_DIR.glob('Final_Ranked_Candidates_*.csv'))
+            if final_csvs:
+                final = pd.read_csv(final_csvs[0])
+                merged = final.merge(dock_df[['SMILES','Docking_Energy']], on='SMILES', how='left')
+                merged['Docking_Energy'] = merged['Docking_Energy'].fillna(merged['Docking_Energy'].mean())
+                merged['Docking_Norm'] = (merged['Docking_Energy'].max() - merged['Docking_Energy']) / (merged['Docking_Energy'].max() - merged['Docking_Energy'].min()+1e-9)
+                merged['Final_Integrated_Score'] = 0.4*merged['Final_Score'] + 0.4*merged['Docking_Norm'] + 0.2*merged['Pred_Assoc']
+                st.dataframe(merged.sort_values('Final_Integrated_Score', ascending=False).head(30))
+            else:
+                st.warning('No Final_Ranked_Candidates CSV found in artifacts.')
+        except Exception as e:
+            st.error(f"Failed to parse docking file: {e}")
+
+elif page == "Diagnostics":
+    st.header("Diagnostics")
+    if (ARTIFACTS_DIR / 'loss_curve.png').exists():
+        st.image(str(ARTIFACTS_DIR / 'loss_curve.png'))
+    if (ARTIFACTS_DIR / 'metrics_comparison.png').exists():
+        st.image(str(ARTIFACTS_DIR / 'metrics_comparison.png'))
+    st.write('Metrics (val/train/test):', metrics, metrics_test)
+
+elif page == "Downloads":
+    st.header("Downloads")
+    if (ARTIFACTS_DIR / 'Association_Model_3D.zip').exists():
+        st.markdown(get_download_link_bytes((ARTIFACTS_DIR / 'Association_Model_3D.zip').read_bytes(), 'Association_Model_3D.zip', 'Download Zip'), unsafe_allow_html=True)
+    else:
+        st.info('Run packaging script to create zip (pipelines/package_artifacts.py).')
+
+# Footer
+st.sidebar.markdown('---')
+st.sidebar.write('Drug_Gene_CDSS — Research demo')

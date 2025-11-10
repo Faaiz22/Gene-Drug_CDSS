@@ -1,0 +1,16 @@
+# Model hyperparameters and architecture definition
+
+drug_encoder:
+  input_dim: 135
+  hidden_layers: [128, 64]
+  activation: relu
+
+protein_encoder:
+  input_dim: 30
+  hidden_layers: [128, 64]
+  activation: relu
+
+fusion:
+  hidden_layers: [64, 32]
+  dropout: 0.2
+  output_activation: sigmoid
