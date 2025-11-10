@@ -4,7 +4,7 @@ pandas
 numpy
 scikit-learn
 biopython
-rdkit-pypi
+rdkit
 tqdm
 umap-learn
 matplotlib
