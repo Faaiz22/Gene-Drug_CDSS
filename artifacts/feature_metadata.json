@@ -1,0 +1,10 @@
+{
+  "kmer_vocab_size": 5452,
+  "kmer_pca_dim": 31,
+  "fingerprint_bits": 2048,
+  "fingerprint_pca_dim": 128,
+  "drug_embedding_dim": 135,
+  "protein_embedding_dim": 38,
+  "pairwise_dim": 540,
+  "rows": 9260
+}
