@@ -1,4 +1,3 @@
-
 import streamlit as st
 from pathlib import Path
 import pandas as pd
@@ -8,22 +7,85 @@ import torch
 import base64
 import io
 from importlib import import_module
+import os  # --- MODIFIED: Added for path joining and file checks
+import requests  # --- MODIFIED: Added for downloading files
 
-ARTIFACTS_DIR = Path("../artifacts")  # relative to app/ when repo root is used; adjust if needed
+# --- MODIFIED: Robust pathing relative to this script file
+# Get the directory where this script (streamlit_app.py) is located
+SCRIPT_DIR = Path(__file__).parent
+# Build the path to artifacts relative to this script's location
+ARTIFACTS_DIR = (SCRIPT_DIR / "../artifacts").resolve()
+ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)  # Ensure the directory exists
+
+# --- MODIFIED: URLs for large files (e.g., from a GitHub Release)
+# --- YOU MUST UPDATE THESE URLS to point to your raw files!
+# --- e.g., "https://github.com/your_user/your_repo/releases/download/v1.0/model.pt"
+REMOTE_ARTIFACTS = {
+    "pairwise_index_labels.csv": "YOUR_URL_TO_pairwise_index_labels.csv",
+    "fusion_embeddings.npy": "YOUR_URL_TO_fusion_embeddings.npy",
+    "features_drug.npy": "YOUR_URL_TO_features_drug.npy",
+    "features_protein.npy": "YOUR_URL_TO_features_protein.npy",
+    "model.pt": "YOUR_URL_TO_model.pt",
+    "metrics.json": "YOUR_URL_TO_metrics.json",
+    "metrics_test.json": "YOUR_URL_TO_metrics_test.json",
+    # --- Add any other files that might be missing or in Git LFS
+    # "fusion_umap_2d.npy": "YOUR_URL_TO_fusion_umap_2d.npy",
+    # "loss_curve.png": "YOUR_URL_TO_loss_curve.png",
+    # "metrics_comparison.png": "YOUR_URL_TO_metrics_comparison.png",
+    # "Association_Model_3D.zip": "YOUR_URL_TO_Association_Model_3D.zip"
+}
+
 
 st.set_page_config(page_title="Drug–Gene 3D Association Explorer", layout="wide", initial_sidebar_state="expanded")
 
-# helper functions
+# --- MODIFIED: Helper function to download files
+def download_file(filename, url):
+    """
+    Downloads a file from a URL to the local ARTIFACTS_DIR if it doesn't exist.
+    """
+    local_path = ARTIFACTS_DIR / filename
+    if not local_path.exists():
+        st.info(f"Downloading {filename}... (This happens once.)")
+        try:
+            with requests.get(url, stream=True) as r:
+                r.raise_for_status()
+                with open(local_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+            st.success(f"Downloaded {filename} successfully.")
+        except Exception as e:
+            st.error(f"Error downloading {filename}: {e}. Please check the URL in the script.")
+            return None
+    return local_path
+
+# --- MODIFIED: Updated loader functions to use the downloader
 @st.cache_data
-def load_csv(path):
-    return pd.read_csv(path)
+def load_csv(filename):
+    """
+    Downloads the CSV if needed, then loads it.
+    """
+    local_path = download_file(filename, REMOTE_ARTIFACTS.get(filename))
+    if local_path and local_path.exists():
+        return pd.read_csv(local_path)
+    return None
 
 @st.cache_data
-def load_npy(path):
-    return np.load(path)
+def load_npy(filename):
+    """
+    Downloads the NPY if needed, then loads it.
+    """
+    local_path = download_file(filename, REMOTE_ARTIFACTS.get(filename))
+    if local_path and local_path.exists():
+        return np.load(local_path)
+    return None
 
 @st.cache_resource
-def load_model(path):
+def load_model(filename):
+    """
+    Downloads the model if needed, then loads it.
+    """
+    local_path = download_file(filename, REMOTE_ARTIFACTS.get(filename))
+    
     # minimal loader using src.models.dual_branch_net.DualBranchNet
     try:
         from src.models.dual_branch_net import DualBranchNet
@@ -33,10 +95,16 @@ def load_model(path):
                 pass
             def eval(self): pass
             def __call__(self, *a, **k): return np.array([0.5])
+    
     model = DualBranchNet()
+    
+    if not (local_path and local_path.exists()):
+        st.warning("Model file not found or failed to download. Using dummy model.")
+        return model # Return dummy model
+
     try:
         import torch
-        state = torch.load(path, map_location='cpu')
+        state = torch.load(local_path, map_location='cpu')
         try:
             model.load_state_dict(state)
         except Exception:
@@ -44,8 +112,9 @@ def load_model(path):
                 model.load_state_dict(state.get('model_state_dict', state))
             except Exception:
                 pass
-    except Exception:
-        pass
+    except Exception as e:
+        st.error(f"Error loading model state: {e}. Using dummy model.")
+    
     return model
 
 def get_download_link_bytes(content: bytes, filename: str, label: str = "Download"):
@@ -54,31 +123,27 @@ def get_download_link_bytes(content: bytes, filename: str, label: str = "Downloa
     return href
 
 # Load artifacts (best-effort)
-artifact_files = {p.name:p for p in ARTIFACTS_DIR.glob("*")} if ARTIFACTS_DIR.exists() else {}
-pairwise_df = None
-fusion = None
-drug_emb = None
-prot_emb = None
-model = None
+# --- MODIFIED: Changed to use new loader functions
+pairwise_df = load_csv("pairwise_index_labels.csv")
+fusion = load_npy("fusion_embeddings.npy")
+drug_emb = load_npy("features_drug.npy")
+prot_emb = load_npy("features_protein.npy")
+model = load_model("model.pt")
+
 metrics = {}
 metrics_test = {}
 
-if (ARTIFACTS_DIR / "pairwise_index_labels.csv").exists():
-    pairwise_df = load_csv(ARTIFACTS_DIR / "pairwise_index_labels.csv")
-if (ARTIFACTS_DIR / "fusion_embeddings.npy").exists():
-    fusion = load_npy(ARTIFACTS_DIR / "fusion_embeddings.npy")
-if (ARTIFACTS_DIR / "features_drug.npy").exists():
-    drug_emb = load_npy(ARTIFACTS_DIR / "features_drug.npy")
-if (ARTIFACTS_DIR / "features_protein.npy").exists():
-    prot_emb = load_npy(ARTIFACTS_DIR / "features_protein.npy")
-if (ARTIFACTS_DIR / "model.pt").exists():
-    model = load_model(ARTIFACTS_DIR / "model.pt")
-if (ARTIFACTS_DIR / "metrics.json").exists():
-    with open(ARTIFACTS_DIR / "metrics.json") as f:
+# --- MODIFIED: Using download_file for JSONs too
+metrics_path = download_file("metrics.json", REMOTE_ARTIFACTS.get("metrics.json"))
+if metrics_path and metrics_path.exists():
+    with open(metrics_path) as f:
         metrics = json.load(f)
-if (ARTIFACTS_DIR / "metrics_test.json").exists():
-    with open(ARTIFACTS_DIR / "metrics_test.json") as f:
+
+metrics_test_path = download_file("metrics_test.json", REMOTE_ARTIFACTS.get("metrics_test.json"))
+if metrics_test_path and metrics_test_path.exists():
+    with open(metrics_test_path) as f:
         metrics_test = json.load(f)
+
 
 # import components
 try:
@@ -112,7 +177,7 @@ if page == "Overview":
 elif page == "Data Explorer":
     st.header("Data Explorer")
     if pairwise_df is None:
-        st.warning("pairwise_index_labels.csv not found in artifacts.")
+        st.warning("pairwise_index_labels.csv not found or failed to load.")
     else:
         st.dataframe(pairwise_df.head(200))
         csv = pairwise_df.to_csv(index=False).encode()
@@ -123,15 +188,20 @@ elif page == "Latent Space":
     if fusion is None or pairwise_df is None:
         st.warning("Fusion embeddings or pairwise index not available.")
     else:
-        coords_path = ARTIFACTS_DIR / "fusion_umap_2d.npy"
-        if coords_path.exists():
-            coords = load_npy(coords_path)
+        # --- MODIFIED: Added downloader for this optional file
+        coords_path_name = "fusion_umap_2d.npy"
+        coords_path = download_file(coords_path_name, REMOTE_ARTIFACTS.get(coords_path_name))
+        
+        if coords_path and coords_path.exists():
+            coords = np.load(coords_path)
         else:
             try:
                 import umap
+                st.info("Calculating UMAP... (This happens once.)")
                 coords = umap.UMAP(n_components=2, random_state=42).fit_transform(fusion)
             except Exception:
                 from sklearn.decomposition import PCA
+                st.info("Calculating PCA... (This happens once.)")
                 coords = PCA(n_components=2).fit_transform(fusion)
         if scatter_2d:
             fig = scatter_2d(coords, pairwise_df, color_by=st.selectbox("Color by", ["Association_Label","Gene_ID","Drug_ID"]))
@@ -209,6 +279,9 @@ elif page == "Docking":
         try:
             dock_df = pd.read_csv(uploaded) if str(uploaded.name).endswith('.csv') else pd.read_json(uploaded)
             st.dataframe(dock_df.head(20))
+            # --- MODIFIED: This part is tricky, as it relies on finding a file.
+            # You may need to adjust this logic depending on where 'Final_Ranked_Candidates' comes from.
+            # For now, it will just look in the local artifacts dir.
             final_csvs = list(ARTIFACTS_DIR.glob('Final_Ranked_Candidates_*.csv'))
             if final_csvs:
                 final = pd.read_csv(final_csvs[0])
@@ -224,18 +297,25 @@ elif page == "Docking":
 
 elif page == "Diagnostics":
     st.header("Diagnostics")
-    if (ARTIFACTS_DIR / 'loss_curve.png').exists():
-        st.image(str(ARTIFACTS_DIR / 'loss_curve.png'))
-    if (ARTIFACTS_DIR / 'metrics_comparison.png').exists():
-        st.image(str(ARTIFACTS_DIR / 'metrics_comparison.png'))
+    # --- MODIFIED: Added downloader for these optional image files
+    loss_curve_path = download_file("loss_curve.png", REMOTE_ARTIFACTS.get("loss_curve.png"))
+    if loss_curve_path and loss_curve_path.exists():
+        st.image(str(loss_curve_path))
+        
+    metrics_comp_path = download_file("metrics_comparison.png", REMOTE_ARTIFACTS.get("metrics_comparison.png"))
+    if metrics_comp_path and metrics_comp_path.exists():
+        st.image(str(metrics_comp_path))
+        
     st.write('Metrics (val/train/test):', metrics, metrics_test)
 
 elif page == "Downloads":
     st.header("Downloads")
-    if (ARTIFACTS_DIR / 'Association_Model_3D.zip').exists():
-        st.markdown(get_download_link_bytes((ARTIFACTS_DIR / 'Association_Model_3D.zip').read_bytes(), 'Association_Model_3D.zip', 'Download Zip'), unsafe_allow_html=True)
+    # --- MODIFIED: Added downloader for the zip file
+    zip_path = download_file("Association_Model_3D.zip", REMOTE_ARTIFACTS.get("Association_Model_3D.zip"))
+    if zip_path and zip_path.exists():
+        st.markdown(get_download_link_bytes(zip_path.read_bytes(), 'Association_Model_3D.zip', 'Download Zip'), unsafe_allow_html=True)
     else:
-        st.info('Run packaging script to create zip (pipelines/package_artifacts.py).')
+        st.info('Run packaging script to create zip (pipelines/package_artifacts.py) and upload it to your release.')
 
 # Footer
 st.sidebar.markdown('---')
